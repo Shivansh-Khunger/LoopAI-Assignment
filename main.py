@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta
 import logging
 import hashlib
+import uvicorn
 from contextlib import asynccontextmanager
 
 # Configure logging
@@ -29,6 +30,7 @@ IDEMPOTENCY_WINDOW_SECONDS = 300  # 5 minutes for idempotency as per requirement
 
 # Flag to control the background processor loop
 processing_active = False
+background_task = None
 
 
 class BatchStatusEnum(str, Enum):
@@ -72,7 +74,7 @@ PRIORITY_MAP = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Data Ingestion API System starting up...")
-    start_background_processor()
+    await async_start_background_processor()
     yield
     # Shutdown
     logger.info("Data Ingestion API System shutting down...")
@@ -126,18 +128,10 @@ async def process_batch(ingestion_id: str, batch_id: str, ids: List[int], priori
                     "error": str(result)
                 }
             else:
-                if isinstance(result, dict):
-                    batch_status_store[ingestion_id][batch_id]["results"][str(id)] = {
-                        "status": "completed",
-                        "data": result.get("data", "processed")
-                    }
-                else:
-                    batch_status_store[ingestion_id][batch_id]["results"][str(id)] = {
-                        "status": "completed",
-                        "data": "processed"
-                    }
-                    logger.warning(
-                        f"Unexpected result type for ID {id}: {type(result)}")
+                batch_status_store[ingestion_id][batch_id]["results"][str(id)] = {
+                    "status": "completed",
+                    "data": result.get("data", "processed") if isinstance(result, dict) else "processed"
+                }
 
         batch_status_store[ingestion_id][batch_id]["status"] = BatchStatusEnum.COMPLETED
         logger.info(f"Completed batch {batch_id} for ingestion {ingestion_id}")
@@ -188,8 +182,8 @@ async def process_queue():
             await asyncio.sleep(1)
             continue
 
-        # Sort the queue by priority (higher value means higher priority) and then by creation time
-        priority_queue.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        # Always re-sort the queue to ensure highest priority items are processed first
+        priority_queue.sort(key=lambda x: (-x[0], x[1]))
 
         current_priority_value, timestamp, ingestion_id, batches_to_process = priority_queue.pop(
             0)
@@ -206,33 +200,61 @@ async def process_queue():
         priority_str = next(
             (k for k, v in PRIORITY_MAP.items() if v == current_priority_value), "UNKNOWN")
 
+        # Process only one batch at a time, then return to queue to check for higher priority items
+        batch_processed = False
         for batch_id, batch_data in batches_to_process.items():
             if batch_data["status"] == BatchStatusEnum.YET_TO_START:
                 await process_batch(ingestion_id, batch_id, batch_data["ids"], priority_str)
-                # Apply delay between batches
-                if processing_active:
-                    await asyncio.sleep(BATCH_DELAY)
+                batch_processed = True
+                break  # Process only one batch, then check queue again
             else:
                 logger.info(
                     f"Batch {batch_id} for ingestion {ingestion_id} already processed or in progress: {batch_data['status']}")
 
-        # After processing all batches for an ingestion, ensure final status update
+        # If we processed a batch, add remaining batches back to queue if any
+        remaining_batches = {bid: bdata for bid, bdata in batches_to_process.items()
+                             if bdata["status"] == BatchStatusEnum.YET_TO_START}
+
+        if remaining_batches:
+            priority_queue.append(
+                (current_priority_value, timestamp, ingestion_id, remaining_batches))
+            logger.info(
+                f"Re-queued ingestion {ingestion_id} with {len(remaining_batches)} remaining batches")
+
+        # Update final status
         update_ingestion_status(ingestion_id)
+
+        # Apply rate limiting delay only if we actually processed a batch
+        if batch_processed and processing_active:
+            await asyncio.sleep(BATCH_DELAY)
 
 
 def start_background_processor():
     """Starts the background processing task."""
-    global processing_active
+    global processing_active, background_task
     if not processing_active:
         processing_active = True
-        asyncio.create_task(process_queue())
+        # Create the background task and store reference
+        background_task = asyncio.create_task(process_queue())
+        logger.info("Background processor started.")
+
+
+async def async_start_background_processor():
+    """Async version of start_background_processor for use in lifespan."""
+    global processing_active, background_task
+    if not processing_active:
+        processing_active = True
+        # Create the background task and store reference
+        background_task = asyncio.create_task(process_queue())
         logger.info("Background processor started.")
 
 
 def stop_background_processor():
     """Stops the background processing task."""
-    global processing_active
+    global processing_active, background_task
     processing_active = False
+    if background_task and not background_task.done():
+        background_task.cancel()
     logger.info("Background processor stopping.")
 
 
@@ -255,7 +277,7 @@ async def ingest_data(request: IngestionRequest, background_tasks: BackgroundTas
         raise HTTPException(
             status_code=400, detail="Priority must be HIGH, MEDIUM, or LOW")
 
-    request_dict = request.dict()
+    request_dict = request.model_dump()
     request_hash = generate_request_hash(request_dict)
     current_time = datetime.now()
 
@@ -296,7 +318,8 @@ async def ingest_data(request: IngestionRequest, background_tasks: BackgroundTas
     priority_value = PRIORITY_MAP.get(request.priority.upper(), 1)
     priority_queue.append(
         (priority_value, time.time(), ingestion_id, batches_data))
-    priority_queue.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    # Sort by priority (descending) then by timestamp (ascending)
+    priority_queue.sort(key=lambda x: (-x[0], x[1]))
 
     # Store request hash for idempotency
     request_hash_store[request_hash] = (ingestion_id, current_time.isoformat())
@@ -350,5 +373,4 @@ async def health_check():
     }
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
