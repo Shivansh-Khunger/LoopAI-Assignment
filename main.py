@@ -1,13 +1,11 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from enum import Enum
 import uuid
 import asyncio
-import httpx
 import json
-import hashlib
-import random
+import time
 from datetime import datetime
 import logging
 from contextlib import asynccontextmanager
@@ -18,76 +16,35 @@ logger = logging.getLogger(__name__)
 
 # In-memory storage (replace with database in production)
 ingestion_status_store = {}
-batch_results_store = {}
+batch_status_store = {}
+request_hash_store = {}
+priority_queue = []  # Global priority queue for processing
 
+# Batch configuration
+BATCH_SIZE = 3  # Process exactly 3 IDs at a time as per requirements
+BATCH_DELAY = 5  # 5 seconds delay between batches as per requirements
 
-def generate_request_hash(request: 'IngestionRequest') -> str:
-    """
-    Generate a deterministic hash for the request to enable idempotency.
-    Identical requests will produce the same hash and return the same request_id.
-    """
-    # Create a normalized representation of the request
-    request_data = {
-        "mappings": sorted([
-            {
-                "id": mapping.id,
-                "source": mapping.source,
-                "target": mapping.target,
-                "transformation": mapping.transformation
-            } for mapping in request.mappings
-        ], key=lambda x: str(x["id"])),  # Sort for consistency
-        "priority": request.priority
-    }
-
-    # Generate hash from JSON representation
-    request_json = json.dumps(request_data, sort_keys=True, default=str)
-    # Use first 16 chars
-    return hashlib.sha256(request_json.encode()).hexdigest()[:16]
-
-
-class StatusEnum(str, Enum):
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
+class BatchStatusEnum(str, Enum):
+    YET_TO_START = "yet_to_start"
+    TRIGGERED = "triggered"
     COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class Mapping(BaseModel):
-    id: str = Field(..., description="Unique identifier for the mapping")
-    source: str = Field(..., description="Source identifier")
-    target: str = Field(..., description="Target identifier")
-    transformation: Optional[Dict[str, Any]] = Field(
-        default=None, description="Transformation rules")
-
 
 class IngestionRequest(BaseModel):
-    mappings: List[Mapping] = Field(..., description="List of data mappings")
-    priority: str = Field(...,
-                          description="Priority level (HIGH, MEDIUM, LOW)")
-
+    ids: List[int] = Field(..., description="List of IDs to process")
+    priority: str = Field(..., description="Priority level (HIGH, MEDIUM, LOW)")
 
 class IngestionResponse(BaseModel):
-    request_id: str
-    status: StatusEnum
-    message: str
+    ingestion_id: str
 
+class BatchInfo(BaseModel):
+    batch_id: str
+    ids: List[int]
+    status: BatchStatusEnum
 
 class StatusResponse(BaseModel):
-    request_id: str
-    status: StatusEnum
-    results: Optional[List[Dict[str, Any]]] = Field(
-        default=None, description="Processing results")
-
-
-class DetailedStatusResponse(BaseModel):
-    request_id: str
-    status: StatusEnum
-    progress: int = Field(..., ge=0, le=100, description="Progress percentage")
-    total_mappings: int
-    processed_mappings: int
-    failed_mappings: int
-    details: Optional[Dict[str, Any]] = None
-
+    ingestion_id: str
+    status: str
+    batches: List[BatchInfo]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -104,244 +61,207 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-
-async def simulate_external_api_call(mapping: Mapping) -> Dict[str, Any]:
-    """Simulate external API call for data processing"""
+async def simulate_external_api_call(id: int) -> Dict[str, Any]:
+    """Simulate external API call for a single ID"""
     try:
-        # Simulate network delay
+        # Simulate processing time for the external API
         await asyncio.sleep(0.5)
-
-        # Simulate random success/failure (70% success rate for better testing)
-        import random
-        if random.random() < 0.7:
-            return {
-                "status": "success",
-                "mapping_id": mapping.id,
-                "processed_data": f"Processed {mapping.source} -> {mapping.target}",
-                "timestamp": datetime.now().isoformat()
-            }
-        else:
-            raise Exception("External API call failed")
+        
+        # Return fixed response format as per requirements
+        return {
+            "id": id,
+            "data": "processed"
+        }
     except Exception as e:
-        logger.error(
-            f"External API call failed for mapping {mapping.id}: {str(e)}")
+        logger.error(f"External API call failed for ID {id}: {str(e)}")
         raise
 
-
-async def process_mappings_batch(request_id: str, mappings: List[Mapping], priority: str):
-    """Process mappings in background with batch processing"""
-    logger.info(
-        f"Starting batch processing for request {request_id} with priority {priority}")
-
-    total_mappings = len(mappings)
-    processed_mappings = 0
-    failed_mappings = 0
-    results = []
-
-    # Update status to in_progress
-    ingestion_status_store[request_id]["status"] = StatusEnum.IN_PROGRESS
-    ingestion_status_store[request_id]["progress"] = 0
-
+async def process_batch(ingestion_id: str, batch_id: str, ids: List[int], priority: str):
+    """Process a single batch of IDs"""
     try:
-        # Process in batches of 5 (configurable)
-        batch_size = 5
-        for i in range(0, len(mappings), batch_size):
-            batch = mappings[i:i + batch_size]
-            batch_tasks = []
-
-            for mapping in batch:
-                task = simulate_external_api_call(mapping)
-                batch_tasks.append(task)
-
-            # Process batch concurrently
-            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-
-            for j, result in enumerate(batch_results):
-                mapping = batch[j]
-                if isinstance(result, Exception):
-                    failed_mappings += 1
-                    results.append({
-                        "mapping_id": mapping.id,
-                        "status": "failed",
-                        "error": str(result),
-                        "timestamp": datetime.now().isoformat()
-                    })
+        logger.info(f"Processing batch {batch_id} (priority: {priority}) with IDs: {ids}")
+        
+        # Mark batch as triggered
+        batch_status_store[ingestion_id][batch_id]["status"] = BatchStatusEnum.TRIGGERED
+        
+        # Process each ID in the batch
+        tasks = [simulate_external_api_call(id) for id in ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+         # Store results and mark the batch as completed
+        for i, result in enumerate(results):
+            id = ids[i]
+            if isinstance(result, Exception):
+                batch_status_store[ingestion_id][batch_id]["results"][id] = {"status": "failed", "error": str(result)}
+            else:
+                # Verify that result is a dictionary and access it safely
+                if isinstance(result, dict):
+                    batch_status_store[ingestion_id][batch_id]["results"][id] = {
+                        "status": "completed", 
+                        "data": result.get("data", "processed")
+                    }
                 else:
-                    processed_mappings += 1
-                    results.append(result)
-
-                # Update progress
-                progress = int(
-                    (processed_mappings + failed_mappings) / total_mappings * 100)
-                ingestion_status_store[request_id]["progress"] = progress
-                ingestion_status_store[request_id]["processed_mappings"] = processed_mappings
-                ingestion_status_store[request_id]["failed_mappings"] = failed_mappings
-
-        # Mark as completed
-        ingestion_status_store[request_id]["status"] = StatusEnum.COMPLETED
-        ingestion_status_store[request_id]["progress"] = 100
-        batch_results_store[request_id] = results
-
-        logger.info(f"Batch processing completed for request {request_id}")
-
+                    # Handle the case where result is not a dict (unexpected but handle it safely)
+                    batch_status_store[ingestion_id][batch_id]["results"][id] = {
+                        "status": "completed", 
+                        "data": "processed"  # Default value when result structure is unexpected
+                    }
+                    logger.warning(f"Unexpected result type for ID {id}: {type(result)}")
+        
+        batch_status_store[ingestion_id][batch_id]["status"] = BatchStatusEnum.COMPLETED
+        
+        # Update the overall ingestion status
+        update_ingestion_status(ingestion_id)
+        
+        logger.info(f"Completed batch {batch_id} for ingestion {ingestion_id}")
     except Exception as e:
-        logger.error(
-            f"Batch processing failed for request {request_id}: {str(e)}")
-        ingestion_status_store[request_id]["status"] = StatusEnum.FAILED
-        ingestion_status_store[request_id]["details"] = {"error": str(e)}
+        logger.error(f"Error processing batch {batch_id}: {str(e)}")
+        batch_status_store[ingestion_id][batch_id]["status"] = BatchStatusEnum.TRIGGERED
+        batch_status_store[ingestion_id][batch_id]["error"] = str(e)
+        update_ingestion_status(ingestion_id)
 
+def update_ingestion_status(ingestion_id: str):
+    """Update the overall status of an ingestion based on its batches"""
+    batches = batch_status_store[ingestion_id]
+    
+    # Get all batch statuses
+    statuses = [batch["status"] for batch in batches.values()]
+    
+    # Apply the required logic:
+    # - If all batches are "yet_to_start", overall status is "yet_to_start"
+    # - If at least one batch is "triggered", overall status is "triggered"
+    # - If all batches are "completed", overall status is "completed"
+    if all(status == BatchStatusEnum.COMPLETED for status in statuses):
+        ingestion_status_store[ingestion_id]["status"] = "completed"
+    elif any(status == BatchStatusEnum.TRIGGERED for status in statuses):
+        ingestion_status_store[ingestion_id]["status"] = "triggered"
+    else:
+        ingestion_status_store[ingestion_id]["status"] = "yet_to_start"
+
+async def background_processor():
+    """Background task to process the global priority queue"""
+    while True:
+        try:
+            if priority_queue:
+                # Sort the queue by priority (HIGH > MEDIUM > LOW) and then by created_time
+                priority_queue.sort(key=lambda x: (
+                    0 if x["priority"] == "HIGH" else (1 if x["priority"] == "MEDIUM" else 2),
+                    x["created_at"]
+                ))
+                
+                # Get the highest priority task
+                task = priority_queue.pop(0)
+                ingestion_id = task["ingestion_id"]
+                batch_id = task["batch_id"]
+                ids = task["ids"]
+                priority = task["priority"]
+                
+                # Process the batch
+                await process_batch(ingestion_id, batch_id, ids, priority)
+                
+                # Wait for the required delay between batches (5 seconds)
+                await asyncio.sleep(BATCH_DELAY)
+            else:
+                # If queue is empty, wait a short time before checking again
+                await asyncio.sleep(0.1)
+                
+        except Exception as e:
+            logger.error(f"Error in background processor: {str(e)}")
+            await asyncio.sleep(1)  # Wait before retry on error
+
+def start_background_processor():
+    """Start the background processor as a task"""
+    asyncio.create_task(background_processor())
+
+@app.on_event("startup")
+async def startup_event():
+    """Start the background processor when the app starts"""
+    start_background_processor()
 
 @app.post("/ingest", response_model=IngestionResponse)
-async def ingest_data(
-    request: IngestionRequest,
-    background_tasks: BackgroundTasks
-):
+async def ingest_data(request: IngestionRequest):
     """
-    Ingest data with mappings and priority.
-    Starts background processing and returns immediately with request ID.
-    Implements idempotency - identical requests return the same request_id.
+    Ingest data IDs with priority.
+    Queues batches for processing and returns immediately with ingestion ID.
+    Implements the required batching and priority handling.
     """
     # Validate input
-    if not request.mappings:
+    if not request.ids:
         raise HTTPException(
-            status_code=400, detail="Mappings list cannot be empty")
+            status_code=400, detail="IDs list cannot be empty")
 
     if request.priority not in ["HIGH", "MEDIUM", "LOW"]:
         raise HTTPException(
             status_code=400, detail="Priority must be HIGH, MEDIUM, or LOW")
-
-    # Check for idempotent request (duplicate submission)
-    request_hash = generate_request_hash(request)
-
-
-        logger.info(
-            f"Returning existing request {existing_request_id} for duplicate submission")
-
-        # Return existing request ID with same status
-        return IngestionResponse(
-            request_id=existing_request_id,
-            status=existing_status["status"],
-            message=f"Ingestion request created successfully. {len(request.mappings)} mappings queued for processing."
-        )
-
-    # Generate new request ID for new requests
-    request_id = str(uuid.uuid4())
-
+    
+    # Generate request ID for new requests
+    ingestion_id = f"ing-{str(uuid.uuid4())[:8]}"
+    
     # Initialize status tracking
-    ingestion_status_store[request_id] = {
-        "status": StatusEnum.PENDING,
-        "progress": 0,
-        "total_mappings": len(request.mappings),
-        "processed_mappings": 0,
-        "failed_mappings": 0,
-        "priority": request.priority,
+    ingestion_status_store[ingestion_id] = {
+        "status": "yet_to_start",
         "created_at": datetime.now().isoformat(),
-        "details": None
     }
-    request_hash_store[request_hash] = request_id  # Store request hash
+    
+    # Split into batches of 3 IDs
+    batch_status_store[ingestion_id] = {}
+    
+    for i in range(0, len(request.ids), BATCH_SIZE):
+        batch_ids = request.ids[i:i + BATCH_SIZE]
+        batch_id = f"batch-{str(uuid.uuid4())[:8]}"
+        
+        # Create batch record
+        batch_status_store[ingestion_id][batch_id] = {
+            "ids": batch_ids,
+            "status": BatchStatusEnum.YET_TO_START,
+            "results": {},
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Queue the batch for processing with priority
+        priority_queue.append({
+            "ingestion_id": ingestion_id,
+            "batch_id": batch_id,
+            "ids": batch_ids,
+            "priority": request.priority,
+            "created_at": datetime.now().timestamp()
+        })
+    
+    logger.info(f"Created ingestion request {ingestion_id} with {len(request.ids)} IDs")
+    
+    # Return the ingestion ID in the exact format required
+    return IngestionResponse(ingestion_id=ingestion_id)
 
-    # Start background processing
-    background_tasks.add_task(
-        process_mappings_batch,
-        request_id,
-        request.mappings,
-        request.priority
-    )
-
-    logger.info(
-        f"Created ingestion request {request_id} with {len(request.mappings)} mappings")
-
-    return IngestionResponse(
-        request_id=request_id,
-        status=StatusEnum.PENDING,
-        message=f"Ingestion request created successfully. {len(request.mappings)} mappings queued for processing."
-    )
-
-
-@app.get("/status/{request_id}", response_model=StatusResponse)
-async def get_status(request_id: str):
+@app.get("/status/{ingestion_id}", response_model=StatusResponse)
+async def get_status(ingestion_id: str):
     """
-    Get the current status of an ingestion request with results.
-    Returns format matching PRD specification.
+    Get the current status of an ingestion request.
+    Returns format matching requirements with batches and their statuses.
     """
-    if request_id not in ingestion_status_store:
-        raise HTTPException(status_code=404, detail="Request ID not found")
-
-    status_data = ingestion_status_store[request_id]
-
-    # Format results according to PRD specification
-    results = None
-    if request_id in batch_results_store and status_data["status"] == StatusEnum.COMPLETED:
-        results = []
-        raw_results = batch_results_store[request_id]
-
-        for i, result in enumerate(raw_results, 1):
-            if result.get("status") == "success":
-                results.append({
-                    "id": i,
-                    "status": "completed"
-                })
-            else:
-                results.append({
-                    "id": i,
-                    "status": "failed",
-                    "error": result.get("error", "Unknown error")
-                })
-
+    if ingestion_id not in ingestion_status_store:
+        raise HTTPException(status_code=404, detail="Ingestion ID not found")
+    
+    if ingestion_id not in batch_status_store:
+        raise HTTPException(status_code=404, detail="Batch status not found")
+    
+    # Get the overall status
+    status = ingestion_status_store[ingestion_id]["status"]
+    
+    # Construct the batches information
+    batches = []
+    for batch_id, batch_data in batch_status_store[ingestion_id].items():
+        batches.append(BatchInfo(
+            batch_id=batch_id,
+            ids=batch_data["ids"],
+            status=batch_data["status"]
+        ))
+    
+    # Return status response in the exact format required
     return StatusResponse(
-        request_id=request_id,
-        status=status_data["status"],
-        results=results
+        ingestion_id=ingestion_id,
+        status=status,
+        batches=batches
     )
-
-
-@app.get("/status/{request_id}/detailed", response_model=DetailedStatusResponse)
-async def get_detailed_status(request_id: str):
-    """
-    Get detailed status information including progress and counts.
-    """
-    if request_id not in ingestion_status_store:
-        raise HTTPException(status_code=404, detail="Request ID not found")
-
-    status_data = ingestion_status_store[request_id]
-
-    return DetailedStatusResponse(
-        request_id=request_id,
-        status=status_data["status"],
-        progress=status_data["progress"],
-        total_mappings=status_data["total_mappings"],
-        processed_mappings=status_data["processed_mappings"],
-        failed_mappings=status_data["failed_mappings"],
-        details=status_data.get("details")
-    )
-
-
-@app.get("/status/{request_id}/results")
-async def get_results(request_id: str):
-    """
-    Legacy endpoint - redirects to main status endpoint for PRD compliance.
-    Get detailed results of processed mappings.
-    """
-    if request_id not in ingestion_status_store:
-        raise HTTPException(status_code=404, detail="Request ID not found")
-
-    if request_id not in batch_results_store:
-        raise HTTPException(
-            status_code=404, detail="Results not available yet")
-
-    status_data = ingestion_status_store[request_id]
-    results = batch_results_store[request_id]
-
-    # Return in legacy format for backward compatibility
-    return {
-        "request_id": request_id,
-        "status": status_data["status"],
-        "total_mappings": status_data["total_mappings"],
-        "processed_mappings": status_data["processed_mappings"],
-        "failed_mappings": status_data["failed_mappings"],
-        "results": results
-    }
-
 
 @app.get("/health")
 async def health_check():
