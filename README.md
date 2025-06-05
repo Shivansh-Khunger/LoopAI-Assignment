@@ -301,23 +301,9 @@ docker run -p 8000:8000 data-ingestion-api
 
 ## Testing Results
 
-All tests pass with 100% PRD compliance:
-
 - ✅ Priority handling verified
 - ✅ Rate limiting enforced
 - ✅ Batch processing accurate
 - ✅ Status tracking correct
 - ✅ Error handling robust
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Ensure all tests pass
-6. Submit a pull request
-
-## License
-
-This project is built according to the specified Product Requirements Document.
